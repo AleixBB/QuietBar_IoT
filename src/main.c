@@ -1,450 +1,121 @@
+import asyncio
+import struct
+import requests
+from bleak import BleakScanner, BleakClient
 
-#include <zephyr/kernel.h>
-#include <zephyr/drivers/sensor.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/hci.h>
-#include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/gatt.h>
-#include <stdio.h>
-#include <math.h>
+CLOUD_URL = "https://quietvenue-backend-uab-avdfehandwdrf3dm.spaincentral-01.azurewebsites.net/api/telemetry"
 
-/* ==========================================
-   1. PARAMETROS DE FUNCIONAMIENTO
-   ========================================== */
+SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
+SOUND_UUID   = "12345678-1234-5678-1234-56789abcdef1"
+ACCEL_UUID   = "12345678-1234-5678-1234-56789abcdef2"
+BATT_UUID    = "12345678-1234-5678-1234-56789abcdef3"  # batería 0..100 % (uint8), característica propia
+CFG_UUID     = "12345678-1234-5678-1234-56789abcdef4"  # umbrales (escritura): uint16 sound_threshold_adc + uint16 motion_threshold_ms2 x100
 
-#define NORMAL_INTERVAL_MS       3000
-#define ALERT_INTERVAL_MS        500
+# MAC de la nRF52840 (la imprime el script al detectarla: "nRF52840 detectada: XX:XX:...").
+# Déjala en "" para conectar con cualquier QuietBar que anuncie el UUID.
+TARGET_MAC = "e0:30:52:d2:b6:6f"
 
-#define MOTION_THRESHOLD_MS2     2.1f
-#define SOUND_THRESHOLD_ADC      40
+# thr_pending: umbrales recibidos del backend pendientes de enviar a la nRF
+# thr_sent:    últimos umbrales escritos en la nRF (None = aún no enviados)
+state = {"sound": None, "accel": None, "battery": None,
+         "thr_pending": None, "thr_sent": None}
 
-#define QUIET_TIME_REQUIRED_MS   5000
 
-   //2. UUIDs BLE
-
-#define BT_UUID_SOUND_SERVICE_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
-
-#define BT_UUID_SOUND_CHAR_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1)
-
-#define BT_UUID_ACCEL_CHAR_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef2)
-
-#define BT_UUID_SOUND_SERVICE \
-    BT_UUID_DECLARE_128(BT_UUID_SOUND_SERVICE_VAL)
-
-#define BT_UUID_SOUND_CHAR \
-    BT_UUID_DECLARE_128(BT_UUID_SOUND_CHAR_VAL)
-
-#define BT_UUID_ACCEL_CHAR \
-    BT_UUID_DECLARE_128(BT_UUID_ACCEL_CHAR_VAL)
-
-   //3. VARIABLES GLOBALES
-
-static uint16_t sound_level_val = 0;
-static uint16_t accel_magnitude_val = 0;
-
-static struct bt_conn *current_conn = NULL;
-
-/* Canal ADC del micrófono */
-
-static const struct adc_dt_spec adc_channel =
-    ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
-
-   //4. SERVICIO GATT
-static void ccc_cfg_changed(
-    const struct bt_gatt_attr *attr,
-    uint16_t value)
-{
-    bool notif_enabled = (value == BT_GATT_CCC_NOTIFY);
-
-    printk("BLE: Notificaciones %s\n",
-           notif_enabled ? "activadas" : "desactivadas");
-}
-
-BT_GATT_SERVICE_DEFINE(quietbar_svc,
-
-    BT_GATT_PRIMARY_SERVICE(BT_UUID_SOUND_SERVICE),
-
-    /* Característica 1: Micrófono */
-
-    BT_GATT_CHARACTERISTIC(
-        BT_UUID_SOUND_CHAR,
-        BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-        BT_GATT_PERM_READ,
-        NULL,
-        NULL,
-        &sound_level_val
-    ),
-
-    BT_GATT_CCC(
-        ccc_cfg_changed,
-        BT_GATT_PERM_READ | BT_GATT_PERM_WRITE
-    ),
-
-    /* Característica 2: Acelerómetro */
-
-    BT_GATT_CHARACTERISTIC(
-        BT_UUID_ACCEL_CHAR,
-        BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-        BT_GATT_PERM_READ,
-        NULL,
-        NULL,
-        &accel_magnitude_val
-    ),
-
-    BT_GATT_CCC(
-        ccc_cfg_changed,
-        BT_GATT_PERM_READ | BT_GATT_PERM_WRITE
-    )
-);
-   //5. CONEXION BLE
-
-static void connected(struct bt_conn *conn, uint8_t err)
-{
-    if (err) {
-        printk("Conexión BLE fallida (%u)\n", err);
-        return;
+def send_to_cloud():
+    payload = {
+        "venueId": "ven-001",
+        "tableId": "T1",
+        "soundAdc": state["sound"],
+        "accelMs2": round(state["accel"], 2),
+        "source": "hardware_live",
     }
-
-    printk("BLE: Dispositivo Central conectado\n");
-
-    current_conn = bt_conn_ref(conn);
-}
-
-static void disconnected(struct bt_conn *conn, uint8_t reason)
-{
-    printk("BLE: Dispositivo desconectado (%u)\n", reason);
-
-    if (current_conn) {
-        bt_conn_unref(current_conn);
-        current_conn = NULL;
-    }
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-    .connected = connected,
-    .disconnected = disconnected,
-};
-   //6. ANUNCIO BLE
-static const struct bt_data ad[] = {
-
-    BT_DATA_BYTES(
-        BT_DATA_FLAGS,
-        (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)
-    ),
-
-    BT_DATA_BYTES(
-        BT_DATA_UUID128_ALL,
-        BT_UUID_SOUND_SERVICE_VAL
-    ),
-};
-
-
-   //7. CONVERSION SENSOR
-
-static float sensor_val_to_float(const struct sensor_value *val)
-{
-    return (float)val->val1 +
-           ((float)val->val2 / 1000000.0f);
-}
-
-   //8. LECTURA MICROFONO GROVE
-
-static uint16_t read_sound_amplitude(void)
-{
-    uint16_t buf;
-
-    struct adc_sequence sequence = {
-        .buffer = &buf,
-        .buffer_size = sizeof(buf),
-    };
-
-    if (adc_sequence_init_dt(&adc_channel, &sequence) < 0) {
-        return 0;
-    }
-
-    uint16_t min_val = 4095;
-    uint16_t max_val = 0;
-
-    /* 20 muestras rápidas */
-
-    for (int i = 0; i < 20; i++) {
-
-        if (adc_read_dt(&adc_channel, &sequence) == 0) {
-
-            if (buf < min_val) {
-                min_val = buf;
-            }
-
-            if (buf > max_val) {
-                max_val = buf;
-            }
-        }
-
-        k_busy_wait(100);
-    }
-
-    return (max_val >= min_val)
-        ? (max_val - min_val)
-        : 0;
-}
-
-
-   //9. PROGRAMA PRINCIPAL
-
-int main(void)
-{
-    int err;
-
-    /* Estado del sistema */
-
-    bool in_alert_mode = false;
-
-    uint32_t quiet_time_ms = 0;
-
-    uint32_t current_interval = NORMAL_INTERVAL_MS;
-
-    float gravity_baseline = 9.81f;
-
-
-    /* --------------------------------------
-       Inicializar MPU6050
-       -------------------------------------- */
-
-    const struct device *const accel_dev =
-        DEVICE_DT_GET_ONE(invensense_mpu6050);
-
-    if (!device_is_ready(accel_dev)) {
-        printk("ERROR: MPU6050 no listo\n");
-        return 0;
-    }
-
-       //Inicializar ADC
-    if (!adc_is_ready_dt(&adc_channel)) {
-        printk("ERROR: ADC canal de sonido no listo\n");
-        return 0;
-    }
-
-    err = adc_channel_setup_dt(&adc_channel);
-
-    if (err < 0) {
-        printk("Error configurando ADC (%d)\n", err);
-        return 0;
-    }
-       //Inicializar Bluetooth
-
-    err = bt_enable(NULL);
-
-    if (err) {
-        printk("Error inicializando Bluetooth (%d)\n", err);
-        return 0;
-    }
-
-    err = bt_le_adv_start(
-        BT_LE_ADV_CONN_FAST_1,
-        ad,
-        ARRAY_SIZE(ad),
-        NULL,
-        0
-    );
-
-    if (err) {
-        printk("Error iniciando BLE (%d)\n", err);
-        return 0;
-    }
-
-       //Mensaje de inicio
-
-    printk("\n");
-    printk("====================================\n");
-    printk("          QUIETBAR ACTIVO           \n");
-    printk("====================================\n");
-    printk("Sensores: MPU6050 + Grove Mic\n");
-    printk("Modo inicial: NORMAL\n");
-    printk("Intervalo NORMAL: %u ms\n", NORMAL_INTERVAL_MS);
-    printk("Intervalo ALERTA: %u ms\n", ALERT_INTERVAL_MS);
-    printk("Umbral movimiento: %.2f m/s2\n",
-           MOTION_THRESHOLD_MS2);
-    printk("Umbral sonido: %u ADC\n",
-           SOUND_THRESHOLD_ADC);
-    printk("Tiempo para volver a NORMAL: %u ms\n",
-           QUIET_TIME_REQUIRED_MS);
-    printk("====================================\n");
-
-       //BUCLE PRINCIPAL
-
-    while (1) {
-
-           //1. LECTURA DEL MICROFONO
-
-        sound_level_val = read_sound_amplitude();
-
-
-           //2. LECTURA DEL ACELEROMETRO
-
-        struct sensor_value accel[3];
-
-        if (sensor_sample_fetch(accel_dev) == 0) {
-
-            if (sensor_channel_get(
-                    accel_dev,
-                    SENSOR_CHAN_ACCEL_XYZ,
-                    accel) == 0) {
-
-                float ax = sensor_val_to_float(&accel[0]);
-                float ay = sensor_val_to_float(&accel[1]);
-                float az = sensor_val_to_float(&accel[2]);
-
-                float total_magnitude =
-                    sqrtf(ax * ax + ay * ay + az * az);
-
-                float dynamic_accel =
-                    fabsf(total_magnitude - gravity_baseline);
-
-                accel_magnitude_val =
-                    (uint16_t)(dynamic_accel * 100.0f);
-
-
-                   //3. DETECCION DE MOVIMIENTO Y SONIDO
-
-                bool motion_detected =
-                    (dynamic_accel >= MOTION_THRESHOLD_MS2);
-
-                bool sound_detected =
-                    (sound_level_val >= SOUND_THRESHOLD_ADC);
-
-
-                   //4. GESTION DE ESTADOS
-                if (motion_detected || sound_detected) {
-
-                    /* Alguno de los sensores ha detectado actividad */
-
-                    quiet_time_ms = 0;
-
-                    if (!in_alert_mode) {
-
-                        in_alert_mode = true;
-
-                        current_interval = ALERT_INTERVAL_MS;
-
-                        printk("\n");
-                        printk("!!! ALERTA QUIETBAR !!!\n");
-
-                        if (motion_detected) {
-                            printk(
-                                "Causa: MOVIMIENTO (%.2f m/s2)\n",
-                                dynamic_accel
-                            );
-                        }
-
-                        if (sound_detected) {
-                            printk(
-                                "Causa: SONIDO (%u ADC)\n",
-                                sound_level_val
-                            );
-                        }
-
-                        printk(
-                            "Nuevo intervalo: %u ms\n",
-                            ALERT_INTERVAL_MS
-                        );
-                    }
-
-                } else {
-
-                    /* Ningun sensor supera su umbral */
-
-                    if (in_alert_mode) {
-
-                        quiet_time_ms += current_interval;
-
-                        /* 5000 ms consecutivos sin actividad */
-
-                        if (quiet_time_ms >= QUIET_TIME_REQUIRED_MS) {
-
-                            in_alert_mode = false;
-
-                            quiet_time_ms = 0;
-
-                            current_interval = NORMAL_INTERVAL_MS;
-
-                            printk("\n");
-                            printk("[OK] Sin movimiento ni ruido elevado.\n");
-                            printk("Volviendo a modo NORMAL.\n");
-
-                            printk(
-                                "Nuevo intervalo: %u ms\n",
-                                NORMAL_INTERVAL_MS
-                            );
-                        }
-
-                    } else {
-
-                        /* Actualizar referencia de gravedad */
-
-                        gravity_baseline =
-                            (gravity_baseline * 0.95f) +
-                            (total_magnitude * 0.05f);
-                    }
-                }
-
-
-                /* ----------------------------------
-                   5. NOTIFICACIONES BLE
-                   ---------------------------------- */
-
-                if (current_conn != NULL) {
-
-                    /* Enviar nivel de sonido */
-
-                    bt_gatt_notify(
-                        current_conn,
-                        &quietbar_svc.attrs[2],
-                        &sound_level_val,
-                        sizeof(sound_level_val)
-                    );
-
-                    /* Enviar magnitud de aceleracion */
-
-                    bt_gatt_notify(
-                        current_conn,
-                        &quietbar_svc.attrs[5],
-                        &accel_magnitude_val,
-                        sizeof(accel_magnitude_val)
-                    );
-                }
-
-
-                /* ----------------------------------
-                   6. INFORMACION DE ESTADO
-                   ---------------------------------- */
-
-                printk(
-                    "[ESTADO] Modo: %s | "
-                    "Movimiento: %.2f m/s2 | "
-                    "Sonido: %u ADC | ",
-                    
-
-                    in_alert_mode ? "ALERTA" : "NORMAL",
-
-                    (float)accel_magnitude_val / 100.0f,
-
-                    sound_level_val,
-
-                    quiet_time_ms,
-
-                    current_interval
-                );
-            }
-        }
-           //7. ESPERA SEGUN EL MODO ACTIVO
-
-        k_msleep(current_interval);
-    }
-
-    return 0;
-}
+    print(state["sound"])
+    print(round(state["accel"], 2))
+    # La batería se mantiene con el último valor conocido
+    if state["battery"] is not None:
+        payload["battery"] = state["battery"]
+
+    try:
+        r = requests.post(CLOUD_URL, json=payload, timeout=5)
+        print(f"[CLOUD {r.status_code}] {payload}")
+        # El backend devuelve la configuración vigente (la del frontend)
+        t = r.json()["thresholds"]
+        thr = (int(t["soundAlertAdc"]), int(round(float(t["motionAlertMs2"]) * 100)))
+        if thr != state["thr_sent"]:
+            state["thr_pending"] = thr
+    except requests.RequestException as e:
+        print(f"[CLOUD ERROR] {e}")
+    except (ValueError, KeyError, TypeError):
+        pass  # respuesta sin umbrales: se ignora
+
+    state["sound"] = state["accel"] = None
+
+
+def on_sound(_, data: bytearray):
+    state["sound"] = int.from_bytes(data[:2], "little")
+    if state["accel"] is not None:
+        send_to_cloud()
+
+
+def on_accel(_, data: bytearray):
+    state["accel"] = int.from_bytes(data[:2], "little") / 100.0
+    if state["sound"] is not None:
+        send_to_cloud()
+
+
+def on_battery(_, data: bytearray):
+    state["battery"] = data[0]
+    print(f"[BATERIA] {state['battery']}%")
+
+
+async def main():
+    while True:
+        print("Buscando emisor BLE QuietBar...")
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, ad: (
+                SERVICE_UUID.lower() in [u.lower() for u in ad.service_uuids]
+                and (not TARGET_MAC or d.address.upper() == TARGET_MAC.upper())
+            ),
+            timeout=15,
+        )
+        if device is None:
+            continue
+
+        print(f"nRF52840 detectada: {device.address}")
+        state["sound"] = state["accel"] = None
+        state["thr_sent"] = None  # reenviar umbrales en cada conexión
+
+        try:
+            async with BleakClient(device) as client:
+                # Batería primero: lectura inicial + notificaciones cada 5 min
+                try:
+                    state["battery"] = (await client.read_gatt_char(BATT_UUID))[0]
+                    print(f"[BATERIA] {state['battery']}% (lectura inicial)")
+                    await client.start_notify(BATT_UUID, on_battery)
+                except Exception as e:
+                    print(f"[BATERIA] no disponible: {e}")
+
+                await client.start_notify(SOUND_UUID, on_sound)
+                await client.start_notify(ACCEL_UUID, on_accel)
+                print("Suscrito a sonido, aceleración y batería.")
+
+                while client.is_connected:
+                    # Enviar a la nRF los umbrales nuevos del backend
+                    thr = state["thr_pending"]
+                    if thr is not None:
+                        state["thr_pending"] = None
+                        try:
+                            await client.write_gatt_char(CFG_UUID, struct.pack("<HH", *thr), response=True)
+                            state["thr_sent"] = thr
+                            print(f"[CFG] umbrales enviados: sound={thr[0]} ADC, motion={thr[1] / 100:.2f} m/s2")
+                        except Exception as e:
+                            print(f"[CFG] error escribiendo umbrales: {e}")
+                    await asyncio.sleep(1)
+        except Exception as e:
+            print(f"[BLE] {e}")
+
+        print("BLE desconectado. Reintentando...")
+        await asyncio.sleep(2)
+
+
+asyncio.run(main())
