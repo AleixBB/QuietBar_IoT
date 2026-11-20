@@ -1,4 +1,5 @@
 import asyncio
+import struct
 import requests
 from bleak import BleakScanner, BleakClient
 
@@ -8,12 +9,16 @@ SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 SOUND_UUID   = "12345678-1234-5678-1234-56789abcdef1"
 ACCEL_UUID   = "12345678-1234-5678-1234-56789abcdef2"
 BATT_UUID    = "12345678-1234-5678-1234-56789abcdef3"  # batería 0..100 % (uint8), característica propia
+CFG_UUID     = "12345678-1234-5678-1234-56789abcdef4"  # umbrales (escritura): uint16 sound_threshold_adc + uint16 motion_threshold_ms2 x100
 
 # MAC de la nRF52840 (la imprime el script al detectarla: "nRF52840 detectada: XX:XX:...").
 # Déjala en "" para conectar con cualquier QuietBar que anuncie el UUID.
 TARGET_MAC = "e0:30:52:d2:b6:6f"
 
-state = {"sound": None, "accel": None, "battery": None}
+# thr_pending: umbrales recibidos del backend pendientes de enviar a la nRF
+# thr_sent:    últimos umbrales escritos en la nRF (None = aún no enviados)
+state = {"sound": None, "accel": None, "battery": None,
+         "thr_pending": None, "thr_sent": None}
 
 
 def send_to_cloud():
@@ -33,8 +38,15 @@ def send_to_cloud():
     try:
         r = requests.post(CLOUD_URL, json=payload, timeout=5)
         print(f"[CLOUD {r.status_code}] {payload}")
+        # El backend devuelve la configuración vigente (la del frontend)
+        t = r.json()["thresholds"]
+        thr = (int(t["soundAlertAdc"]), int(round(float(t["motionAlertMs2"]) * 100)))
+        if thr != state["thr_sent"]:
+            state["thr_pending"] = thr
     except requests.RequestException as e:
         print(f"[CLOUD ERROR] {e}")
+    except (ValueError, KeyError, TypeError):
+        pass  # respuesta sin umbrales: se ignora
 
     state["sound"] = state["accel"] = None
 
@@ -71,6 +83,7 @@ async def main():
 
         print(f"nRF52840 detectada: {device.address}")
         state["sound"] = state["accel"] = None
+        state["thr_sent"] = None  # reenviar umbrales en cada conexión
 
         try:
             async with BleakClient(device) as client:
@@ -87,6 +100,16 @@ async def main():
                 print("Suscrito a sonido, aceleración y batería.")
 
                 while client.is_connected:
+                    # Enviar a la nRF los umbrales nuevos del backend
+                    thr = state["thr_pending"]
+                    if thr is not None:
+                        state["thr_pending"] = None
+                        try:
+                            await client.write_gatt_char(CFG_UUID, struct.pack("<HH", *thr), response=True)
+                            state["thr_sent"] = thr
+                            print(f"[CFG] umbrales enviados: sound={thr[0]} ADC, motion={thr[1] / 100:.2f} m/s2")
+                        except Exception as e:
+                            print(f"[CFG] error escribiendo umbrales: {e}")
                     await asyncio.sleep(1)
         except Exception as e:
             print(f"[BLE] {e}")
