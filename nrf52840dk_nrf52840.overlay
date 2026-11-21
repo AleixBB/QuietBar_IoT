@@ -1,33 +1,48 @@
+/*
+ * QuietBar - nRF52840 DK
+ *  Microfono Grove : SIG -> P0.03 (AIN1)
+ *  Bateria         : VDD interno (no necesita cable)
+ *  MPU6050 (I2C0)  : SDA -> P0.26, SCL -> P0.27
+ */
+
 / {
-	zephyr,user {
-		io-channels = <&adc 0>;
-	};
+    zephyr,user {
+        /* <&adc 0> = microfono, <&adc 1> = VDD (bateria) */
+        io-channels = <&adc 0>, <&adc 1>;
+    };
 };
 
 &adc {
-	status = "okay";
-	#address-cells = <1>;
-	#size-cells = <0>;
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
 
-	channel@0 {
-		reg = <0>;
-		zephyr,gain = "ADC_GAIN_1_6";
-		zephyr,reference = "ADC_REF_INTERNAL";
-		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-		zephyr,input-positive = <NRF_SAADC_AIN1>; /* Pin A0 (P0.03) */
-		zephyr,resolution = <12>;
-	};
+    channel@0 {   /* microfono */
+        reg = <0>;
+        zephyr,gain = "ADC_GAIN_1_6";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,input-positive = <NRF_SAADC_AIN1>;   /* P0.03 */
+        zephyr,resolution = <12>;
+    };
+
+    channel@1 {   /* VDD */
+        reg = <1>;
+        zephyr,gain = "ADC_GAIN_1_6";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+        zephyr,input-positive = <NRF_SAADC_VDD>;
+        zephyr,resolution = <12>;
+    };
 };
 
 &i2c0 {
-	status = "okay";
-	pinctrl-0 = <&i2c0_default>;
-	pinctrl-1 = <&i2c0_sleep>;
-	pinctrl-names = "default", "sleep";
+    status = "okay";
+    clock-frequency = <I2C_BITRATE_FAST>;
 
-	mpu6050: mpu6050@68 {
-		compatible = "invensense,mpu6050";
-		reg = <0x68>;
-		status = "okay";
-	};
+    mpu6050: mpu6050@68 {
+        compatible = "invensense,mpu6050";
+        reg = <0x68>;   /* AD0 a GND o sin conectar = 0x68; AD0 a VCC = 0x69 */
+        status = "okay";
+    };
 };
