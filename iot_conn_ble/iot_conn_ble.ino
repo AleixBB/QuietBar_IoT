@@ -4,6 +4,7 @@
 const char* serviceUUID   = "12345678-1234-5678-1234-56789abcdef0";
 const char* soundCharUUID = "12345678-1234-5678-1234-56789abcdef1"; // Micro
 const char* accelCharUUID = "12345678-1234-5678-1234-56789abcdef2"; // Accelerometre
+const char* mlClassCharUUID = "12345678-1234-5678-1234-56789abcdef3"; // Classe IA
 
 void setup() {
   Serial.begin(115200);
@@ -39,11 +40,15 @@ void loop() {
       // Obtenim les dues característiques
       BLECharacteristic soundChar = peripheral.characteristic(soundCharUUID);
       BLECharacteristic accelChar = peripheral.characteristic(accelCharUUID);
-      
-      if (soundChar && accelChar && soundChar.canSubscribe() && accelChar.canSubscribe()) {
+      BLECharacteristic mlClassChar = peripheral.characteristic(mlClassCharUUID);
+
+      if (soundChar && accelChar && mlClassChar && soundChar.canSubscribe() && accelChar.canSubscribe() && mlClassChar.canSubscribe()) {
         soundChar.subscribe();
         accelChar.subscribe();
-        Serial.println("Subscrit a les notificacions de Soroll i Acceleració.");
+        mlClassChar.subscribe();
+
+        
+        Serial.println("Subscrit a les notificacions de Soroll, Acceleració i Classe ML.");
         
         while (peripheral.connected()) {
           // Lectura de Soroll (Micròfon)
@@ -65,6 +70,13 @@ void loop() {
             Serial.print("Vibració: ");
             Serial.print(accel_ms2, 2);
             Serial.println(" m/s2");
+          }
+
+          if (mlClassChar.valueUpdated()) {
+            uint8_t ml_class = 255;
+            mlClassChar.readValue(&ml_class, sizeof(ml_class));
+            Serial.print("[IA] Classe detectada (índex): ");
+            Serial.println(ml_class);
           }
         }
       } else {

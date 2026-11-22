@@ -6,8 +6,12 @@ CLOUD_URL = "https://quietvenue-backend-uab-avdfehandwdrf3dm.spaincentral-01.azu
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 SOUND_UUID   = "12345678-1234-5678-1234-56789abcdef1"
 ACCEL_UUID   = "12345678-1234-5678-1234-56789abcdef2"
+ML_CLASS_UUID= "12345678-1234-5678-1234-56789abcdef3"
 
-state = {"sound": None, "accel": None}
+# Ordre alfabètic exacte de les classes a Edge Impulse
+CLASS_LABELS = {0: "cop", 1: "silenci", 2: "veu", 255: "incert"}
+
+state = {"sound": None, "accel": None, "ml_class": None}
 
 def send_to_cloud():
     payload = {
@@ -15,6 +19,7 @@ def send_to_cloud():
         "tableId": "T1",
         "soundAdc": state["sound"],
         "accelMs2": round(state["accel"], 2),
+        "mlClass": CLASS_LABELS.get(state["ml_class"], "desconegut"),
         "source": "hardware_live",
     }
     try:
@@ -22,17 +27,23 @@ def send_to_cloud():
         print(f"[CLOUD {r.status_code}] {payload}")
     except requests.RequestException as e:
         print(f"[CLOUD ERROR] {e}")
-    state["sound"] = state["accel"] = None
+    state["sound"] = state["accel"] = state["ml_class"] = None
+
+def try_send():
+    if state["sound"] is not None and state["accel"] is not None and state["ml_class"] is not None:
+        send_to_cloud()
 
 def on_sound(_, data: bytearray):
     state["sound"] = int.from_bytes(data[:2], "little")
-    if state["accel"] is not None:
-        send_to_cloud()
+    try_send()
 
 def on_accel(_, data: bytearray):
     state["accel"] = int.from_bytes(data[:2], "little") / 100.0
-    if state["sound"] is not None:
-        send_to_cloud()
+    try_send()
+
+def on_ml_class(_, data: bytearray):
+    state["ml_class"] = data[0]
+    try_send()
 
 async def main():
     while True:
@@ -48,7 +59,8 @@ async def main():
             async with BleakClient(device) as client:
                 await client.start_notify(SOUND_UUID, on_sound)
                 await client.start_notify(ACCEL_UUID, on_accel)
-                print("Suscrito a sonido y aceleración.")
+                await client.start_notify(ML_CLASS_UUID, on_ml_class)
+                print("Suscrito a sonido, aceleración y clase IA.")
                 while client.is_connected:
                     await asyncio.sleep(1)
         except Exception as e:
